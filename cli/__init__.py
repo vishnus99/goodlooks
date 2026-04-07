@@ -1,0 +1,1 @@
+"""GoodLooks CLI package."""

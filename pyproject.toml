@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "goodlooks"
+version = "0.1.0"
+description = "Sleek local CLI to-do list manager"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "click",
+  "rich",
+]
+
+[project.scripts]
+goodlooks = "cli.goodlooks:goodlooks"
+
+[tool.setuptools]
+packages = ["cli"]
