@@ -4,12 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "goodlooks"
-version = "0.1.0"
+version = "0.2.0"
 description = "Sleek local CLI to-do list manager"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "click",
+  "Pillow",
+  "prompt_toolkit",
   "rich",
 ]
 

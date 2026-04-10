@@ -14,6 +14,18 @@ python3 -m pip install -e .
 goodlooks --help
 ```
 
+Wallpaper integration (macOS) is enabled by default and refreshes after successful task updates (`add`, `done`, `rm`, `edit`).
+
+```bash
+goodlooks wallpaper
+```
+
+Disable it when needed:
+
+```bash
+GOODLOOKS_WALLPAPER=0 goodlooks add "No wallpaper refresh"
+```
+
 Optional shortcut:
 
 ```bash
