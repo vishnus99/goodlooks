@@ -14,7 +14,7 @@ python3 -m pip install -e .
 goodlooks --help
 ```
 
-## V3 interactive features (MVP)
+## Interactive Features
 
 Get recommendation steps for a task:
 
