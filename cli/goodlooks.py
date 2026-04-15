@@ -4,7 +4,9 @@ import json
 import os
 import queue
 import shlex
+import signal
 import subprocess
+import sys
 import threading
 import time
 import webbrowser
@@ -13,9 +15,17 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib import import_module
 from pathlib import Path
 from typing import Any
+from urllib.error import URLError
 from urllib.parse import urlparse
+from urllib.request import urlopen
 
 import click
+from cli.recommender_agent import (
+    current_recommender_settings,
+    diagnose_recommender,
+    safe_generate_recommendation,
+    save_recommender_config,
+)
 from rich import box
 from rich.console import Console, Group
 from rich.panel import Panel
@@ -32,7 +42,6 @@ URGENCY_RANK = {"high": 0, "normal": 1, "low": 2}
 
 NO_COLOR = os.getenv("NO_COLOR") is not None
 console = Console(no_color=NO_COLOR)
-WALLPAPER_FILE_NAME = "goodlooks.png"
 
 # Live board (SSE): queues receive JSON task snapshots after each save_data.
 _board_sse_queues: list[queue.Queue[str | None]] = []
@@ -87,150 +96,6 @@ def save_data(data: dict[str, Any]) -> None:
     with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     notify_board_clients_after_save(data.get("tasks", []))
-
-
-def wallpaper_enabled() -> bool:
-    return os.getenv("GOODLOOKS_WALLPAPER", "1").strip().lower() not in {
-        "0",
-        "false",
-        "off",
-        "no",
-    }
-
-
-def wallpaper_output_path() -> Path:
-    out_dir = Path.home() / "Documents" / "Goodlooks Wallpaper"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    return out_dir / WALLPAPER_FILE_NAME
-
-
-def get_main_screen_size() -> tuple[int, int]:
-    try:
-        appkit = import_module("AppKit")
-        screens = getattr(appkit.NSScreen, "screens")()
-        if screens and len(screens) > 0:
-            frame = screens[0].frame()
-            scale = float(getattr(screens[0], "backingScaleFactor")())
-            width = max(1, int(frame.size.width * scale))
-            height = max(1, int(frame.size.height * scale))
-            return width, height
-    except Exception:
-        pass
-    return (2560, 1440)
-
-
-def task_lines_for_wallpaper(tasks: list[dict[str, Any]]) -> list[str]:
-    pending = [t for t in sort_tasks(tasks) if not t["done"]]
-    if not pending:
-        return ['No pending tasks. Add one with: goodlooks add "..."']
-    lines: list[str] = []
-    for task in pending:
-        urgency = task.get("urgency", "normal")
-        urg_mark = "▲" if urgency == "high" else ("▼" if urgency == "low" else "●")
-        lines.append(f"#{task['id']:>3}  {urg_mark}  {task['title']}")
-    return lines
-
-
-def truncate_text_to_width(
-    draw: Any, font: Any, text: str, max_width: int, suffix: str = "..."
-) -> str:
-    if draw.textlength(text, font=font) <= max_width:
-        return text
-    trimmed = text
-    while trimmed and draw.textlength(trimmed + suffix, font=font) > max_width:
-        trimmed = trimmed[:-1]
-    if not trimmed:
-        return suffix
-    return trimmed + suffix
-
-
-def render_wallpaper_image(tasks: list[dict[str, Any]], output_path: Path) -> None:
-    image_mod = import_module("PIL.Image")
-    draw_mod = import_module("PIL.ImageDraw")
-    font_mod = import_module("PIL.ImageFont")
-    width, height = get_main_screen_size()
-    image = image_mod.new("RGB", (width, height), color=(12, 16, 27))
-    draw = draw_mod.Draw(image)
-
-    title_size = max(26, width // 44)
-    body_size = max(18, width // 88)
-    try:
-        title_font = font_mod.truetype("Menlo.ttc", title_size)
-        body_font = font_mod.truetype("Menlo.ttc", body_size)
-    except Exception:
-        title_font = font_mod.load_default()
-        body_font = font_mod.load_default()
-
-    outer_margin_x = max(160, width // 10)
-    outer_margin_y = max(90, height // 12)
-    panel_x0 = outer_margin_x
-    panel_y0 = outer_margin_y
-    panel_x1 = width - outer_margin_x
-    panel_y1 = height - outer_margin_y
-    panel_radius = max(18, width // 80)
-    draw.rounded_rectangle(
-        (panel_x0, panel_y0, panel_x1, panel_y1),
-        radius=panel_radius,
-        fill=(20, 26, 40),
-        outline=(53, 68, 104),
-        width=max(2, width // 900),
-    )
-
-    padding_x = panel_x0 + max(36, width // 40)
-    right_limit = panel_x1 - max(36, width // 40)
-    y = panel_y0 + max(34, height // 40)
-    total = len(tasks)
-    pending = sum(1 for t in tasks if not t["done"])
-    done_n = total - pending
-    header = f"{APP_TITLE}   total {total} · pending {pending} · done {done_n}"
-    header = truncate_text_to_width(draw, title_font, header, max(100, right_limit - padding_x))
-    draw.text(
-        (padding_x, y),
-        header,
-        font=title_font,
-        fill=(181, 140, 255),
-    )
-    y += title_size + max(20, height // 60)
-
-    lines = task_lines_for_wallpaper(tasks)
-    line_gap = max(8, body_size // 3)
-    max_lines = max(
-        4,
-        (panel_y1 - y - max(22, height // 48)) // (body_size + line_gap),
-    )
-    display_lines = lines[: max_lines - 1] if len(lines) > max_lines else lines
-    for line in display_lines:
-        safe_line = truncate_text_to_width(draw, body_font, line, max(100, right_limit - padding_x))
-        draw.text((padding_x, y), safe_line, font=body_font, fill=(231, 236, 246))
-        y += body_size + line_gap
-    if len(lines) > max_lines:
-        remaining = len(lines) - len(display_lines)
-        draw.text(
-            (padding_x, y),
-            f"... and {remaining} more",
-            font=body_font,
-            fill=(146, 156, 178),
-        )
-
-    image.save(output_path, format="PNG")
-
-
-def apply_wallpaper(path: Path) -> None:
-    script = f'tell application "System Events" to tell current desktop to set picture to "{path}"'
-    subprocess.run(["osascript", "-e", script], check=True, capture_output=True, text=True)
-
-
-def refresh_wallpaper(tasks: list[dict[str, Any]]) -> bool:
-    if not wallpaper_enabled():
-        return False
-    output_path = wallpaper_output_path().resolve()
-    try:
-        render_wallpaper_image(tasks, output_path)
-        apply_wallpaper(output_path)
-        return True
-    except Exception as exc:
-        console.print(f"[yellow]Wallpaper refresh skipped:[/yellow] {exc}")
-        return False
 
 
 def recommendation_for_task(task: dict[str, Any]) -> dict[str, Any]:
@@ -852,7 +717,6 @@ def add(title: str, urgency: str) -> None:
     }
     data["tasks"].append(task)
     save_data(data)
-    refresh_wallpaper(data["tasks"])
     console.print(
         f"[green]Added task #[/green][bold]{next_id}[/bold] "
         f"[dim]({urgency})[/dim]: {cleaned}"
@@ -894,7 +758,6 @@ def done(task_id: int) -> None:
         return
     task["done"] = True
     save_data(data)
-    refresh_wallpaper(data["tasks"])
     console.print(f"[green]Completed task #[/green][bold]{task_id}[/bold].")
 
 
@@ -916,7 +779,6 @@ def rm(task_id: int, force: bool) -> None:
 
     data["tasks"] = [t for t in data["tasks"] if t["id"] != task_id]
     save_data(data)
-    refresh_wallpaper(data["tasks"])
     console.print(f"[green]Removed task #[/green][bold]{task_id}[/bold].")
 
 
@@ -955,22 +817,9 @@ def edit(task_id: int, new_title: str | None, urgency: str | None) -> None:
         parts.append(f"urgency {old_u} -> {urgency}")
 
     save_data(data)
-    refresh_wallpaper(data["tasks"])
     console.print(
         f"[green]Updated task #[/green][bold]{task_id}[/bold]: " + " · ".join(parts)
     )
-
-
-@goodlooks.command()
-def wallpaper() -> None:
-    """Regenerate and apply wallpaper from current tasks."""
-    data = load_data()
-    if not wallpaper_enabled():
-        console.print("[yellow]Wallpaper integration disabled via GOODLOOKS_WALLPAPER.[/yellow]")
-        return
-    applied = refresh_wallpaper(data["tasks"])
-    if applied:
-        console.print(f"[green]Wallpaper updated:[/green] {wallpaper_output_path()}")
 
 
 @goodlooks.command()
@@ -981,8 +830,371 @@ def recommend(task_id: int) -> None:
     task = find_task_by_id(data["tasks"], task_id)
     if task is None:
         raise click.ClickException(f"Task #{task_id} not found. Run `goodlooks list`.")
-    rec = recommendation_for_task(task)
+    rec, used_fallback, fallback_reason = safe_generate_recommendation(
+        task,
+        fallback_fn=recommendation_for_task,
+    )
+    if used_fallback:
+        reason = f" ({fallback_reason})" if fallback_reason else ""
+        console.print(f"[dim]Using local recommender fallback{reason}.[/dim]")
     console.print(Panel(recommendation_to_text(task, rec), title="Recommended steps"))
+
+
+def render_doctor_report(report: dict[str, Any]) -> None:
+    summary = (
+        f"Backend: [bold]{report['backend']}[/bold]  "
+        f"Provider: [bold]{report['provider']}[/bold]  "
+        f"Source: [bold]{report.get('provider_source', 'configured')}[/bold]  "
+        f"Model: [bold]{report['model']}[/bold]  "
+        f"Timeout: [bold]{report['timeout']}s[/bold]"
+    )
+    status_title = "Doctor checks: OK" if report["ok"] else "Doctor checks: Needs attention"
+    status_style = "green" if report["ok"] else "yellow"
+    console.print(Panel(summary, title=status_title, border_style=status_style))
+
+    table = Table(show_header=True, header_style="bold cyan", box=box.SIMPLE_HEAVY)
+    table.add_column("Check", style="white")
+    table.add_column("Status", width=10)
+    table.add_column("Details", style="dim")
+    for item in report["checks"]:
+        status = "[green]OK[/green]" if item["status"] == "ok" else "[red]FAIL[/red]"
+        table.add_row(item["name"], status, item["detail"])
+    console.print(table)
+    config_path = report.get("config_path")
+    if config_path:
+        console.print(f"[dim]Config path:[/dim] {config_path}")
+
+
+def install_python_package(package_name: str) -> bool:
+    try:
+        result = subprocess.run(  # noqa: S603
+            [sys.executable, "-m", "pip", "install", package_name],
+            check=False,
+        )
+    except Exception as exc:
+        console.print(f"[yellow]Could not run pip install {package_name}:[/yellow] {exc}")
+        return False
+    return result.returncode == 0
+
+
+def ollama_start_service(wait_for_ready: bool = True) -> tuple[bool, str]:
+    is_up, base_url, _ = ollama_status_details()
+    if is_up:
+        return True, f"Ollama already running at {base_url}."
+
+    try:
+        proc = subprocess.Popen(  # noqa: S603
+            ["ollama", "serve"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        return False, "`ollama` command not found. Install Ollama from https://ollama.com/download."
+    except Exception as exc:
+        return False, f"Failed to start Ollama: {exc}"
+
+    if not wait_for_ready:
+        return True, f"Started Ollama process (pid {proc.pid})."
+
+    deadline = time.time() + 8.0
+    while time.time() < deadline:
+        time.sleep(0.35)
+        up, _, _ = ollama_status_details()
+        if up:
+            return True, f"Started Ollama at {base_url}."
+    return True, f"Started process (pid {proc.pid}) but Ollama not reachable yet at {base_url}."
+
+
+def ollama_pull_model(model: str) -> bool:
+    try:
+        result = subprocess.run(  # noqa: S603
+            ["ollama", "pull", model],
+            check=False,
+        )
+    except FileNotFoundError:
+        console.print("[yellow]`ollama` command not found while trying to pull model.[/yellow]")
+        return False
+    return result.returncode == 0
+
+
+def apply_doctor_fixes(report: dict[str, Any]) -> list[dict[str, Any]]:
+    provider = str(report.get("provider", ""))
+    model = str(report.get("model", ""))
+    actions: list[dict[str, Any]] = []
+
+    failed_checks = {item["name"] for item in report.get("checks", []) if item["status"] != "ok"}
+
+    if "python_package" in failed_checks:
+        package = "langchain-ollama" if provider == "ollama" else "langchain-openai"
+        if click.confirm(f"Install missing package `{package}` now?", default=True):
+            ok = install_python_package(package)
+            actions.append({"action": "install_package", "target": package, "ok": ok})
+            if ok:
+                console.print(f"[green]Installed {package}.[/green]")
+            else:
+                console.print(f"[yellow]Failed to install {package}.[/yellow]")
+        else:
+            actions.append({"action": "install_package", "target": package, "ok": False, "skipped": True})
+
+    if provider == "ollama":
+        if "ollama" in failed_checks:
+            if click.confirm("Start Ollama service now?", default=True):
+                ok, msg = ollama_start_service(wait_for_ready=True)
+                console.print(f"[green]{msg}[/green]" if ok else f"[yellow]{msg}[/yellow]")
+                actions.append({"action": "start_ollama", "target": "service", "ok": ok, "message": msg})
+            else:
+                actions.append({"action": "start_ollama", "target": "service", "ok": False, "skipped": True})
+        report_after_start = diagnose_recommender()
+        missing_model = any(
+            c["name"] == "ollama" and "not found" in c["detail"]
+            for c in report_after_start.get("checks", [])
+        )
+        if missing_model and model and click.confirm(f"Pull model `{model}` now?", default=True):
+            ok = ollama_pull_model(model)
+            actions.append({"action": "pull_model", "target": model, "ok": ok})
+            if ok:
+                console.print(f"[green]Pulled model {model}.[/green]")
+            else:
+                console.print(f"[yellow]Failed to pull model {model}.[/yellow]")
+        elif missing_model and model:
+            actions.append({"action": "pull_model", "target": model, "ok": False, "skipped": True})
+    elif provider == "openai" and "openai_api_key" in failed_checks:
+        console.print(
+            "[yellow]Cannot auto-fix OpenAI key.[/yellow] Export [bold]OPENAI_API_KEY[/bold] in your shell."
+        )
+        actions.append(
+            {
+                "action": "set_openai_api_key",
+                "target": "OPENAI_API_KEY",
+                "ok": False,
+                "manual": True,
+            }
+        )
+
+    return actions
+
+
+@goodlooks.command()
+@click.option(
+    "--fix",
+    "apply_fixes",
+    is_flag=True,
+    help="Attempt to auto-fix common recommender setup issues.",
+)
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="Print machine-readable JSON output.",
+)
+def doctor(apply_fixes: bool, json_output: bool) -> None:
+    """Show recommender health checks and setup hints."""
+    report = diagnose_recommender()
+    if not json_output:
+        render_doctor_report(report)
+
+    if not report["ok"]:
+        provider = str(report["provider"])
+        model = str(report["model"])
+        if not json_output:
+            if provider == "ollama":
+                console.print(
+                    f"[dim]Hint:[/dim] Start Ollama and run [bold]ollama pull {model}[/bold], "
+                    "then retry [bold]goodlooks doctor[/bold]."
+                )
+            elif provider == "openai":
+                console.print(
+                    "[dim]Hint:[/dim] Export [bold]OPENAI_API_KEY[/bold] and retry "
+                    "[bold]goodlooks doctor[/bold]."
+                )
+        if apply_fixes:
+            if not json_output:
+                console.print("\n[bold]Applying fixes...[/bold]")
+            actions = apply_doctor_fixes(report)
+            final_report = diagnose_recommender()
+            if json_output:
+                console.print_json(
+                    data={
+                        "initial_report": report,
+                        "actions": actions,
+                        "final_report": final_report,
+                    }
+                )
+                return
+            if actions:
+                console.print("\n[bold]Doctor after fixes:[/bold]")
+                render_doctor_report(final_report)
+    elif apply_fixes:
+        if json_output:
+            console.print_json(data={"initial_report": report, "actions": [], "final_report": report})
+            return
+        console.print("[green]No fixes needed.[/green]")
+    elif json_output:
+        console.print_json(data=report)
+
+
+def ollama_base_url() -> str:
+    settings = current_recommender_settings()
+    return str(settings.get("ollama_base_url", "http://127.0.0.1:11434"))
+
+
+def ollama_status_details() -> tuple[bool, str, int]:
+    base_url = ollama_base_url().rstrip("/")
+    try:
+        with urlopen(f"{base_url}/api/tags", timeout=2.0) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+        models = payload.get("models", []) if isinstance(payload, dict) else []
+        model_count = len(models) if isinstance(models, list) else 0
+        return True, base_url, model_count
+    except (URLError, TimeoutError, ValueError, OSError):
+        return False, base_url, 0
+
+
+@goodlooks.group()
+def ollama() -> None:
+    """Manage local Ollama service for recommendations."""
+
+
+@ollama.command("status")
+def ollama_status() -> None:
+    """Show Ollama server status."""
+    is_up, base_url, model_count = ollama_status_details()
+    if is_up:
+        console.print(
+            f"[green]Ollama is running[/green] at {base_url} with "
+            f"[bold]{model_count}[/bold] model(s) available."
+        )
+    else:
+        console.print(f"[yellow]Ollama is not reachable[/yellow] at {base_url}.")
+        console.print("[dim]Run `goodlooks ollama start` to launch it.[/dim]")
+
+
+@ollama.command("start")
+def ollama_start() -> None:
+    """Start Ollama server in the background if needed."""
+    ok, msg = ollama_start_service(wait_for_ready=True)
+    if ok and "not reachable yet" not in msg:
+        console.print(f"[green]{msg}[/green]")
+        return
+    console.print(f"[yellow]{msg}[/yellow]")
+    if ok:
+        console.print("[dim]Run `goodlooks ollama status` again in a few seconds.[/dim]")
+    else:
+        raise click.ClickException(msg)
+
+
+@ollama.command("stop")
+def ollama_stop() -> None:
+    """Stop Ollama server process if running."""
+    try:
+        result = subprocess.run(  # noqa: S603
+            ["pgrep", "-f", "ollama serve"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise click.ClickException("`pgrep` is not available on this system.") from exc
+
+    pids = [int(x.strip()) for x in result.stdout.splitlines() if x.strip().isdigit()]
+    if not pids:
+        up, base_url, _ = ollama_status_details()
+        if up:
+            console.print(
+                f"[yellow]Ollama API is reachable at {base_url}, but no local `ollama serve` process was found to stop.[/yellow]"
+            )
+        else:
+            console.print("[dim]Ollama is not running.[/dim]")
+        return
+
+    stopped = 0
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            stopped += 1
+        except Exception:
+            continue
+    if stopped > 0:
+        console.print(f"[green]Sent stop signal to {stopped} Ollama process(es).[/green]")
+    else:
+        console.print("[yellow]Could not stop Ollama processes.[/yellow]")
+
+
+@goodlooks.command()
+def setup() -> None:
+    """Interactively create a user-specific recommender config."""
+    current = current_recommender_settings()
+    console.print("[bold bright_magenta]GoodLooks recommender setup[/bold bright_magenta]")
+    console.print("[dim]This writes your user config file for recommender defaults.[/dim]")
+
+    backend_default = str(current.get("backend", "langchain"))
+    backend = click.prompt(
+        "Backend",
+        type=click.Choice(["langchain", "heuristic"], case_sensitive=False),
+        default=backend_default,
+        show_default=True,
+    ).lower()
+
+    provider_default = str(current.get("provider", "ollama"))
+    provider_prompt_default = (
+        provider_default if provider_default in {"auto", "ollama", "openai"} else "auto"
+    )
+    provider = click.prompt(
+        "Provider",
+        type=click.Choice(["auto", "ollama", "openai"], case_sensitive=False),
+        default=provider_prompt_default,
+        show_default=True,
+    ).lower()
+
+    model_default = str(current.get("model", "llama3.1"))
+    model = click.prompt("Model name", default=model_default, show_default=True).strip()
+    if not model:
+        model = model_default
+
+    timeout_default = float(current.get("timeout_sec", 8.0))
+    timeout = click.prompt(
+        "Timeout (seconds)",
+        type=float,
+        default=timeout_default,
+        show_default=True,
+    )
+    timeout = max(1.0, min(30.0, timeout))
+
+    ollama_url_default = str(current.get("ollama_base_url", "http://127.0.0.1:11434"))
+    ollama_base_url = click.prompt(
+        "Ollama base URL",
+        default=ollama_url_default,
+        show_default=True,
+    ).strip()
+    if not ollama_base_url:
+        ollama_base_url = ollama_url_default
+
+    config = {
+        "backend": backend,
+        "provider": provider,
+        "model": model,
+        "timeout_sec": timeout,
+        "ollama_base_url": ollama_base_url,
+    }
+    path = save_recommender_config(config)
+    console.print(f"[green]Saved recommender config:[/green] {path}")
+
+    if backend == "langchain" and provider in {"auto", "ollama"}:
+        if click.confirm("Start Ollama service now?", default=True):
+            ok, msg = ollama_start_service(wait_for_ready=True)
+            console.print(f"[green]{msg}[/green]" if ok else f"[yellow]{msg}[/yellow]")
+        if model and click.confirm(f"Pull Ollama model `{model}` now?", default=False):
+            ok = ollama_pull_model(model)
+            if ok:
+                console.print(f"[green]Pulled model {model}.[/green]")
+            else:
+                console.print(f"[yellow]Failed to pull model {model}.[/yellow]")
+
+    if click.confirm("Run doctor with auto-fix now?", default=True):
+        doctor.main(args=["--fix"], prog_name="goodlooks doctor", standalone_mode=False)
+    else:
+        console.print("[dim]Run `goodlooks doctor --fix` to validate and auto-fix setup.[/dim]")
 
 
 @goodlooks.command()
@@ -1019,8 +1231,14 @@ def help_command(ctx: click.Context) -> None:
     console.print("  goodlooks edit --id 2 --urgency low")
     console.print("  goodlooks rm --id 2")
     console.print("  goodlooks recommend --id 2")
+    console.print("  goodlooks setup")
+    console.print("  goodlooks doctor")
+    console.print("  goodlooks doctor --fix")
+    console.print("  goodlooks doctor --json")
+    console.print("  goodlooks ollama status")
+    console.print("  goodlooks ollama start")
+    console.print("  goodlooks ollama stop")
     console.print("  goodlooks board")
-    console.print("  goodlooks wallpaper")
     console.print("  goodlooks shell")
 
 
@@ -1090,8 +1308,12 @@ def build_shell_session() -> Any | None:
             "edit",
             "help",
             "recommend",
+            "setup",
+            "ollama",
+            "start",
+            "status",
+            "stop",
             "board",
-            "wallpaper",
             "version",
             "clear",
             "exit",

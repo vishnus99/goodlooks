@@ -1,4 +1,7 @@
 click
 rich
 prompt_toolkit
-Pillow
+langchain
+langchain-ollama
+langchain-openai
+pydantic

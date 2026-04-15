@@ -10,7 +10,10 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "click",
-  "Pillow",
+  "langchain",
+  "langchain-ollama",
+  "langchain-openai",
+  "pydantic",
   "prompt_toolkit",
   "rich",
 ]
