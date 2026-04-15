@@ -2,21 +2,16 @@ from __future__ import annotations
 
 import json
 import os
-import queue
 import shlex
 import signal
 import subprocess
 import sys
-import threading
 import time
-import webbrowser
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib import import_module
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
-from urllib.parse import urlparse
 from urllib.request import urlopen
 
 import click
@@ -42,13 +37,6 @@ URGENCY_RANK = {"high": 0, "normal": 1, "low": 2}
 
 NO_COLOR = os.getenv("NO_COLOR") is not None
 console = Console(no_color=NO_COLOR)
-
-# Live board (SSE): queues receive JSON task snapshots after each save_data.
-_board_sse_queues: list[queue.Queue[str | None]] = []
-_board_sse_lock = threading.Lock()
-_board_http_server: HTTPServer | None = None
-_board_http_thread: threading.Thread | None = None
-_board_http_start_lock = threading.Lock()
 
 
 def data_file_path() -> Path:
@@ -95,7 +83,6 @@ def save_data(data: dict[str, Any]) -> None:
     path = ensure_data_file()
     with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
-    notify_board_clients_after_save(data.get("tasks", []))
 
 
 def recommendation_for_task(task: dict[str, Any]) -> dict[str, Any]:
@@ -187,320 +174,6 @@ def recommendation_to_text(task: dict[str, Any], rec: dict[str, Any]) -> Text:
     return out
 
 
-def render_board_page_html() -> str:
-    return """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>GoodLooks Board</title>
-  <style>
-    :root { color-scheme: dark; }
-    body { margin: 0; font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0d1220; color: #ecf0ff; }
-    .wrap { display: grid; grid-template-columns: 360px 1fr; min-height: 100vh; }
-    .left { border-right: 1px solid #2a3657; padding: 20px; overflow: auto; }
-    .right { padding: 24px; }
-    h1 { margin: 0 0 8px 0; font-size: 24px; color: #c79bff; }
-    .meta { color: #9ea8c3; margin-bottom: 16px; }
-    .live { font-size: 12px; color: #6ee7b7; margin-bottom: 8px; }
-    .task { width: 100%; text-align: left; border: 1px solid #2a3657; border-radius: 10px; background: #141d33; color: inherit; padding: 12px; margin-bottom: 10px; cursor: pointer; }
-    .task:hover { border-color: #5a7bff; }
-    .task.done { opacity: 0.6; }
-    .task.selected { border-color: #c79bff; box-shadow: 0 0 0 1px #c79bff; }
-    .id { color: #86a2ff; font-size: 12px; }
-    .title { font-weight: 600; margin-top: 4px; }
-    .urgency { font-size: 12px; color: #f4c66f; margin-top: 4px; }
-    .panel { background: #141d33; border: 1px solid #2a3657; border-radius: 12px; padding: 16px; }
-    .steps li { margin-bottom: 8px; }
-    .pill { font-size: 12px; color: #9ea8c3; margin-left: 8px; }
-    .muted { color: #9ea8c3; }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <aside class="left">
-      <h1>GoodLooks Board</h1>
-      <div class="live" id="live">Live · waiting for updates…</div>
-      <div class="meta">Click a task for recommended steps. The list updates when you change tasks in the CLI.</div>
-      <div id="tasks"></div>
-    </aside>
-    <main class="right">
-      <div id="panel" class="panel">
-        <h2 style="margin-top:0">Recommendation</h2>
-        <div class="muted">Select a task from the left.</div>
-      </div>
-    </main>
-  </div>
-  <script>
-    let tasks = [];
-    let selectedId = null;
-
-    function esc(s) {
-      return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-    }
-
-    function recommend(task) {
-      const title = (task.title || "").toLowerCase();
-      if (task.done) {
-        return {
-          summary: "Task is already complete.",
-          first_action: "Review and archive the result.",
-          estimated_time_minutes: 3,
-          steps: [
-            "Confirm the outcome still matches your expectations.",
-            "Capture any notes or follow-up tasks."
-          ],
-          risks_or_blockers: []
-        };
-      }
-
-      let steps = [];
-      if (title.includes("call") || title.includes("email") || title.includes("message") || title.includes("reply")) {
-        steps = [
-          "Draft a short message with the desired outcome.",
-          "Send it and set a follow-up reminder.",
-          "Log the response and next action."
-        ];
-      } else if (title.includes("buy") || title.includes("order") || title.includes("shop") || title.includes("purchase")) {
-        steps = [
-          "List exactly what is needed before purchasing.",
-          "Check one quick price/availability source.",
-          "Complete purchase and save confirmation details."
-        ];
-      } else if (title.includes("write") || title.includes("plan") || title.includes("doc") || title.includes("draft")) {
-        steps = [
-          "Define the deliverable in one sentence.",
-          "Create a rough outline with 3-5 bullets.",
-          "Draft first pass, then do a quick edit pass."
-        ];
-      } else {
-        steps = [
-          "Define the concrete success criteria for this task.",
-          "Break it into a 15-minute first step.",
-          "Execute the first step and decide the next move."
-        ];
-      }
-
-      let estimate = 25;
-      if (task.urgency === "high") {
-        steps.unshift("Time-box to 25 minutes and start immediately.");
-        estimate = 35;
-      } else if (task.urgency === "low") {
-        steps.unshift("Batch this with similar low-priority tasks.");
-        estimate = 20;
-      }
-
-      return {
-        summary: "Recommended approach for: " + task.title,
-        first_action: steps[0],
-        estimated_time_minutes: estimate,
-        steps,
-        risks_or_blockers: ["Unclear success criteria", "Waiting on other people"]
-      };
-    }
-
-    function renderPanel(task) {
-      const rec = recommend(task);
-      const panel = document.getElementById("panel");
-      const steps = rec.steps.map((s) => "<li>" + esc(s) + "</li>").join("");
-      const blockers = (rec.risks_or_blockers || []).map((b) => "<li>" + esc(b) + "</li>").join("");
-      panel.innerHTML =
-        '<h2 style="margin-top:0">' + esc(task.title) + ' <span class="pill">#' + task.id + "</span></h2>" +
-        '<p class="muted">' + esc(rec.summary) + "</p>" +
-        '<p><strong>First action:</strong> ' + esc(rec.first_action) + "</p>" +
-        '<p><strong>Estimated time:</strong> ' + rec.estimated_time_minutes + " min</p>" +
-        '<h3>Steps</h3><ol class="steps">' + steps + "</ol>" +
-        "<h3>Potential blockers</h3><ul>" + blockers + "</ul>";
-    }
-
-    function emptyPanel() {
-      document.getElementById("panel").innerHTML =
-        '<h2 style="margin-top:0">Recommendation</h2><div class="muted">Select a task from the left.</div>';
-    }
-
-    function renderTasks() {
-      const host = document.getElementById("tasks");
-      if (!tasks.length) {
-        host.innerHTML = '<div class="muted">No tasks yet. Add one with goodlooks add "…".</div>';
-        emptyPanel();
-        selectedId = null;
-        return;
-      }
-      host.innerHTML = "";
-      tasks.forEach((task) => {
-        const btn = document.createElement("button");
-        btn.type = "button";
-        btn.className = "task" + (task.done ? " done" : "") + (selectedId === task.id ? " selected" : "");
-        btn.innerHTML =
-          '<div class="id">#' + task.id + "</div>" +
-          '<div class="title">' + (task.done ? "✓ " : "○ ") + esc(task.title) + "</div>" +
-          '<div class="urgency">urgency: ' + esc(task.urgency || "normal") + "</div>";
-        btn.addEventListener("click", () => {
-          selectedId = task.id;
-          renderTasks();
-          renderPanel(task);
-        });
-        host.appendChild(btn);
-      });
-      if (selectedId != null) {
-        const t = tasks.find((x) => x.id === selectedId);
-        if (t) renderPanel(t);
-        else { selectedId = null; emptyPanel(); }
-      }
-    }
-
-    function setLive(msg) {
-      const el = document.getElementById("live");
-      if (el) el.textContent = msg;
-    }
-
-    const es = new EventSource("/events");
-    es.onmessage = (e) => {
-      try {
-        tasks = JSON.parse(e.data);
-      } catch (err) {
-        setLive("Live · update parse error");
-        return;
-      }
-      setLive("Live · list updated " + new Date().toLocaleTimeString());
-      renderTasks();
-    };
-    es.onerror = () => {
-      setLive("Live · reconnecting…");
-    };
-  </script>
-</body>
-</html>
-"""
-
-
-class _BoardHTTPServer(HTTPServer):
-    allow_reuse_address = True
-
-
-class BoardRequestHandler(BaseHTTPRequestHandler):
-    def log_message(self, format: str, *args: Any) -> None:
-        return
-
-    def do_GET(self) -> None:
-        path = urlparse(self.path).path or "/"
-        if path == "/":
-            body = render_board_page_html().encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if path == "/api/tasks":
-            data = load_data()
-            body = json.dumps(sort_tasks(data["tasks"])).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if path == "/events":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.end_headers()
-            q: queue.Queue[str | None] = queue.Queue(maxsize=8)
-            with _board_sse_lock:
-                _board_sse_queues.append(q)
-            data_path = ensure_data_file()
-            last_payload = ""
-            last_mtime_ns = 0
-            try:
-                initial = json.dumps(sort_tasks(load_data()["tasks"]))
-                last_payload = initial
-                try:
-                    last_mtime_ns = data_path.stat().st_mtime_ns
-                except OSError:
-                    last_mtime_ns = 0
-                q.put_nowait(initial)
-            except Exception:
-                pass
-            try:
-                while True:
-                    try:
-                        payload = q.get(timeout=2.0)
-                    except queue.Empty:
-                        # Cross-process fallback: if tasks.json changed, push latest.
-                        try:
-                            new_mtime_ns = data_path.stat().st_mtime_ns
-                        except OSError:
-                            new_mtime_ns = last_mtime_ns
-                        if new_mtime_ns != last_mtime_ns:
-                            last_mtime_ns = new_mtime_ns
-                            latest = json.dumps(sort_tasks(load_data()["tasks"]))
-                            if latest != last_payload:
-                                last_payload = latest
-                                line = ("data: " + latest + "\n\n").encode("utf-8")
-                                self.wfile.write(line)
-                                self.wfile.flush()
-                        self.wfile.write(b": ping\n\n")
-                        self.wfile.flush()
-                        continue
-                    if payload is None:
-                        break
-                    last_payload = payload
-                    line = ("data: " + payload + "\n\n").encode("utf-8")
-                    self.wfile.write(line)
-                    self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            finally:
-                with _board_sse_lock:
-                    try:
-                        _board_sse_queues.remove(q)
-                    except ValueError:
-                        pass
-            return
-        self.send_error(404, "Not Found")
-
-
-def default_board_port() -> int:
-    raw = os.getenv("GOODLOOKS_BOARD_PORT", "9876")
-    try:
-        p = int(raw)
-        return p if 1 <= p <= 65535 else 9876
-    except ValueError:
-        return 9876
-
-
-def ensure_board_server_running() -> int:
-    global _board_http_server, _board_http_thread
-    with _board_http_start_lock:
-        if (
-            _board_http_thread is not None
-            and _board_http_thread.is_alive()
-            and _board_http_server is not None
-        ):
-            return int(_board_http_server.server_address[1])
-        port_start = default_board_port()
-        server: HTTPServer | None = None
-        for port in range(port_start, min(port_start + 30, 65536)):
-            try:
-                server = _BoardHTTPServer(("127.0.0.1", port), BoardRequestHandler)
-                break
-            except OSError:
-                continue
-        if server is None:
-            server = _BoardHTTPServer(("127.0.0.1", 0), BoardRequestHandler)
-        thread = threading.Thread(
-            target=server.serve_forever,
-            name="goodlooks-board-http",
-            daemon=True,
-        )
-        thread.start()
-        _board_http_server = server
-        _board_http_thread = thread
-        return int(server.server_address[1])
-
-
 def find_task_by_id(tasks: list[dict[str, Any]], task_id: int) -> dict[str, Any] | None:
     for task in tasks:
         if task["id"] == task_id:
@@ -519,25 +192,6 @@ def sort_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(tasks, key=sort_key)
 
 
-def notify_board_clients_after_save(tasks: list[dict[str, Any]]) -> None:
-    """Push latest tasks to all connected board tabs (SSE)."""
-    with _board_sse_lock:
-        if not _board_sse_queues:
-            return
-        clients = list(_board_sse_queues)
-    payload = json.dumps(sort_tasks(tasks))
-    for q in clients:
-        try:
-            while True:
-                try:
-                    q.get_nowait()
-                except queue.Empty:
-                    break
-            q.put_nowait(payload)
-        except Exception:
-            pass
-
-
 def print_command_footer() -> None:
     foot = Text.assemble(
         ("Commands: ", "dim"),
@@ -546,6 +200,7 @@ def print_command_footer() -> None:
         ("rm ", "cyan"),
         ("edit ", "cyan"),
         ("list ", "cyan"),
+        ("status ", "cyan"),
         ("\n", ""),
         ("Help: ", "dim"),
         ("goodlooks --help", "bold green"),
@@ -678,6 +333,79 @@ def render_tasks(
     print_command_footer()
 
 
+def render_status_view(tasks: list[dict[str, Any]]) -> None:
+    sorted_tasks = sort_tasks(tasks)
+    pending_tasks = [t for t in sorted_tasks if not t["done"]]
+    done_tasks = [t for t in sorted_tasks if t["done"]]
+
+    by_urgency: dict[str, list[dict[str, Any]]] = {"high": [], "normal": [], "low": []}
+    for task in pending_tasks:
+        urgency = task.get("urgency", "normal")
+        if urgency not in by_urgency:
+            urgency = "normal"
+        by_urgency[urgency].append(task)
+
+    counts = Text.assemble(
+        ("Status View  ", "bold magenta"),
+        ("pending ", "dim"),
+        (str(len(pending_tasks)), "bold yellow"),
+        ("  │  ", "dim cyan"),
+        ("done ", "dim"),
+        (str(len(done_tasks)), "bold green"),
+        ("  │  ", "dim cyan"),
+        ("total ", "dim"),
+        (str(len(sorted_tasks)), "bold white"),
+    )
+    console.print(
+        Panel(
+            counts,
+            title="[bold bright_magenta]═══ GoodLooks ═══[/bold bright_magenta]",
+            border_style="bright_blue",
+            box=box.ROUNDED,
+            padding=(1, 2),
+        )
+    )
+
+    pending_table = Table(
+        title="Pending By Urgency",
+        show_header=True,
+        header_style="bold bright_cyan",
+        border_style="blue",
+    )
+    pending_table.add_column("Urgency", width=14)
+    pending_table.add_column("Count", justify="right", width=7)
+    pending_table.add_column("Visible items", overflow="fold")
+    for urgency in ("high", "normal", "low"):
+        group = by_urgency[urgency]
+        item_preview = ", ".join(f"#{t['id']} {t['title']}" for t in group[:5])
+        if len(group) > 5:
+            item_preview += f", +{len(group) - 5} more"
+        if not item_preview:
+            item_preview = "None"
+        pending_table.add_row(
+            urgency_markup(urgency),
+            str(len(group)),
+            item_preview,
+        )
+    console.print(pending_table)
+
+    done_table = Table(
+        title="Recently Completed",
+        show_header=True,
+        header_style="bold bright_cyan",
+        border_style="green",
+    )
+    done_table.add_column("ID", justify="right", width=4)
+    done_table.add_column("Title", overflow="fold")
+    done_table.add_column("Urgency", width=14)
+    for task in done_tasks[:8]:
+        done_table.add_row(str(task["id"]), task["title"], urgency_markup(task.get("urgency", "normal")))
+    if not done_tasks:
+        done_table.add_row("-", "No completed tasks yet.", "-")
+    console.print(done_table)
+    print_command_footer()
+
+
 @click.group(invoke_without_command=True)
 @click.version_option(version=VERSION, prog_name=APP_NAME)
 @click.pass_context
@@ -743,6 +471,13 @@ def list_tasks(show_mode: str, urgency: str | None) -> None:
     """Show tasks."""
     data = load_data()
     render_tasks(data["tasks"], mode=show_mode, urgency_filter=urgency)
+
+
+@goodlooks.command("status")
+def status_view() -> None:
+    """Show grouped visibility view (pending + completed snapshot)."""
+    data = load_data()
+    render_status_view(data["tasks"])
 
 
 @goodlooks.command()
@@ -1197,27 +932,6 @@ def setup() -> None:
         console.print("[dim]Run `goodlooks doctor --fix` to validate and auto-fix setup.[/dim]")
 
 
-@goodlooks.command()
-def board() -> None:
-    """Open interactive task board (local server + live SSE updates)."""
-    port = ensure_board_server_running()
-    url = f"http://127.0.0.1:{port}/"
-    opened = webbrowser.open(url)
-    if opened:
-        console.print(f"[green]Opened board:[/green] {url}")
-    else:
-        console.print(f"[yellow]Could not auto-open browser. Open manually:[/yellow] {url}")
-    console.print(
-        "[dim]Server is running on 127.0.0.1 — leave this terminal open. "
-        "Press Ctrl+C to stop.[/dim]"
-    )
-    try:
-        while True:
-            time.sleep(3600)
-    except KeyboardInterrupt:
-        console.print("\n[dim]Board server stopped.[/dim]")
-
-
 @goodlooks.command("help")
 @click.pass_context
 def help_command(ctx: click.Context) -> None:
@@ -1230,6 +944,7 @@ def help_command(ctx: click.Context) -> None:
     console.print("  goodlooks edit --id 2 --new-title \"Buy oat milk\"")
     console.print("  goodlooks edit --id 2 --urgency low")
     console.print("  goodlooks rm --id 2")
+    console.print("  goodlooks status")
     console.print("  goodlooks recommend --id 2")
     console.print("  goodlooks setup")
     console.print("  goodlooks doctor")
@@ -1238,7 +953,6 @@ def help_command(ctx: click.Context) -> None:
     console.print("  goodlooks ollama status")
     console.print("  goodlooks ollama start")
     console.print("  goodlooks ollama stop")
-    console.print("  goodlooks board")
     console.print("  goodlooks shell")
 
 
@@ -1308,12 +1022,12 @@ def build_shell_session() -> Any | None:
             "edit",
             "help",
             "recommend",
+            "status",
             "setup",
             "ollama",
             "start",
             "status",
             "stop",
-            "board",
             "version",
             "clear",
             "exit",

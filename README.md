@@ -79,16 +79,10 @@ goodlooks doctor --fix
 goodlooks doctor --json
 ```
 
-Open a clickable board in your browser. This starts a **local HTTP server** on `127.0.0.1` and opens the board; the task list **updates live** (Server-Sent Events) whenever you change tasks from the CLI (`add`, `done`, `rm`, `edit`). Leave the tab open while you work in the terminal.
+Show a board-like status snapshot directly in the terminal (pending grouped by urgency + recent completed):
 
 ```bash
-goodlooks board
-```
-
-Default port is **9876**. Override if something else is using it:
-
-```bash
-GOODLOOKS_BOARD_PORT=9988 goodlooks board
+goodlooks status
 ```
 
 Optional shortcut:
